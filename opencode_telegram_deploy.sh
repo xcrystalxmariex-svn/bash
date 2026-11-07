@@ -2,6 +2,7 @@
 # ==============================================================================
 # OpenCode Agent & Telegram Bot Deployer
 # Hardened + auto-restart + modern OpenCode install/update + PATH wrapper
+# Termux-safe shebangs
 # ==============================================================================
 set -euo pipefail
 
@@ -14,12 +15,16 @@ echo "=========================================="
 # ---------------------------------------------------------------------------
 if [ -n "${TERMUX_VERSION:-}" ] || [ -d "/data/data/com.termux" ]; then
     ENV_TYPE="termux"
+    # Absolute Termux bash — /usr/bin/env does not exist on stock Termux
+    BASH_SHEBANG="#!/data/data/com.termux/files/usr/bin/bash"
     echo "[+] Detected Environment: Termux on Android"
 elif [ -f /etc/os-release ]; then
     ENV_TYPE="linux"
+    BASH_SHEBANG="#!/usr/bin/env bash"
     echo "[+] Detected Environment: Standard Linux"
 else
     ENV_TYPE="unknown"
+    BASH_SHEBANG="#!/usr/bin/env bash"
     echo "[!] Unknown environment, defaulting to generic Linux layout"
 fi
 
@@ -60,24 +65,17 @@ fi
 echo "[*] Checking for OpenCode..."
 
 install_opencode() {
-    # Prefer modern packages, then legacy, then official install script
     echo "[*] Installing / updating OpenCode..."
-
     local ok=0
 
-    # 1) Official V2 scoped package
     if npm install -g "@opencode/cli@latest" 2>/dev/null; then
         ok=1
-    # 2) Legacy package name still in wide use
     elif npm install -g "opencode-ai@latest" 2>/dev/null; then
         ok=1
-    # 3) Bare name fallback
     elif npm install -g "opencode@latest" 2>/dev/null; then
         ok=1
-    # 4) Official curl installer (puts binary in ~/.opencode/bin or similar)
     elif curl -fsSL https://opencode.ai/install | bash; then
         ok=1
-        # Ensure the install location is on PATH for this session
         if [ -d "$HOME/.opencode/bin" ]; then
             export PATH="$HOME/.opencode/bin:$PATH"
         fi
@@ -104,7 +102,6 @@ else
     if command -v opencode >/dev/null 2>&1; then
         echo "[+] OpenCode installed: $(command -v opencode)  ($(opencode --version 2>/dev/null || echo '?'))"
     else
-        # curl installer may have put it in ~/.opencode/bin
         if [ -x "$HOME/.opencode/bin/opencode" ]; then
             export PATH="$HOME/.opencode/bin:$PATH"
             echo "[+] OpenCode found at $HOME/.opencode/bin/opencode"
@@ -163,7 +160,6 @@ else
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 fi
 
-# Prevent accidental commit of secrets / logs
 if [ ! -f "$WORKDIR/.gitignore" ]; then
     cat > "$WORKDIR/.gitignore" <<'GITIGNORE'
 .env
@@ -352,13 +348,14 @@ chmod 755 "$WORKDIR/bridge.py"
 
 # ---------------------------------------------------------------------------
 # 7. Generate hardened start.sh WITH AUTO-RESTART WATCHDOG
+#    (Termux-safe shebang)
 # ---------------------------------------------------------------------------
-cat > "$WORKDIR/start.sh" << 'EOF'
-#!/usr/bin/env bash
+cat > "$WORKDIR/start.sh" << EOF
+${BASH_SHEBANG}
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-cd "$DIR"
+DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+cd "\$DIR"
 
 # Safe env loading
 if [ -f .env ]; then
@@ -371,10 +368,10 @@ else
     exit 1
 fi
 
-PORT="${OPENCODE_PORT:-4096}"
-HOST="${OPENCODE_HOST:-127.0.0.1}"
-LOG="$DIR/opencode_server.log"
-PIDFILE="$DIR/opencode.pid"
+PORT="\${OPENCODE_PORT:-4096}"
+HOST="\${OPENCODE_HOST:-127.0.0.1}"
+LOG="\$DIR/opencode_server.log"
+PIDFILE="\$DIR/opencode.pid"
 WATCHDOG_INTERVAL=15
 
 # Termux wake lock
@@ -384,8 +381,8 @@ if command -v termux-wake-lock >/dev/null 2>&1; then
 fi
 
 # Ensure ~/.opencode/bin is on PATH if the curl installer was used
-if [ -d "$HOME/.opencode/bin" ]; then
-    export PATH="$HOME/.opencode/bin:$PATH"
+if [ -d "\$HOME/.opencode/bin" ]; then
+    export PATH="\$HOME/.opencode/bin:\$PATH"
 fi
 
 # shellcheck source=/dev/null
@@ -393,54 +390,54 @@ source venv/bin/activate
 
 port_in_use() {
     if command -v ss >/dev/null 2>&1; then
-        ss -tuln 2>/dev/null | grep -q ":${PORT} "
+        ss -tuln 2>/dev/null | grep -q ":\${PORT} "
     elif command -v lsof >/dev/null 2>&1; then
-        lsof -i ":${PORT}" >/dev/null 2>&1
+        lsof -i ":\${PORT}" >/dev/null 2>&1
     else
-        (echo >/dev/tcp/127.0.0.1/"${PORT}") >/dev/null 2>&1
+        (echo >/dev/tcp/127.0.0.1/"\${PORT}") >/dev/null 2>&1
     fi
 }
 
 start_opencode() {
-    if [ -f "$PIDFILE" ]; then
-        oldpid=$(cat "$PIDFILE" 2>/dev/null || true)
-        if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-            kill "$oldpid" 2>/dev/null || true
+    if [ -f "\$PIDFILE" ]; then
+        oldpid=\$(cat "\$PIDFILE" 2>/dev/null || true)
+        if [ -n "\$oldpid" ] && kill -0 "\$oldpid" 2>/dev/null; then
+            kill "\$oldpid" 2>/dev/null || true
             sleep 1
         fi
-        rm -f "$PIDFILE"
+        rm -f "\$PIDFILE"
     fi
 
-    echo "[*] Starting OpenCode on ${HOST}:${PORT}..."
-    nohup opencode serve --port "$PORT" >> "$LOG" 2>&1 &
-    echo $! > "$PIDFILE"
-    echo "[+] OpenCode PID $(cat "$PIDFILE") (log: $LOG)"
+    echo "[*] Starting OpenCode on \${HOST}:\${PORT}..."
+    nohup opencode serve --port "\$PORT" >> "\$LOG" 2>&1 &
+    echo \$! > "\$PIDFILE"
+    echo "[+] OpenCode PID \$(cat "\$PIDFILE") (log: \$LOG)"
     sleep 2
 }
 
 if port_in_use; then
-    echo "[+] Port $PORT already in use — assuming OpenCode is running."
+    echo "[+] Port \$PORT already in use — assuming OpenCode is running."
 else
     start_opencode
     if ! port_in_use; then
-        echo "[!] OpenCode did not bind to port $PORT. Check $LOG"
+        echo "[!] OpenCode did not bind to port \$PORT. Check \$LOG"
     fi
 fi
 
 # Background watchdog
 (
     while true; do
-        sleep "$WATCHDOG_INTERVAL"
+        sleep "\$WATCHDOG_INTERVAL"
         if ! port_in_use; then
-            echo "$(date -Is) [watchdog] OpenCode not listening on :$PORT — restarting" >> "$LOG"
+            echo "\$(date -Is) [watchdog] OpenCode not listening on :\$PORT — restarting" >> "\$LOG"
             start_opencode
         fi
     done
 ) &
-WATCHDOG_PID=$!
-echo "[+] Watchdog running (PID $WATCHDOG_PID, interval ${WATCHDOG_INTERVAL}s)"
+WATCHDOG_PID=\$!
+echo "[+] Watchdog running (PID \$WATCHDOG_PID, interval \${WATCHDOG_INTERVAL}s)"
 
-trap 'kill $WATCHDOG_PID 2>/dev/null || true' EXIT
+trap 'kill \$WATCHDOG_PID 2>/dev/null || true' EXIT
 
 echo "[*] Starting Telegram Bot bridge (foreground)..."
 exec python3 bridge.py
@@ -449,27 +446,21 @@ EOF
 chmod 755 "$WORKDIR/start.sh"
 
 # ---------------------------------------------------------------------------
-# 8. Install PATH wrapper so the full stack is one command away
+# 8. Install PATH wrappers (Termux-safe shebang)
 # ---------------------------------------------------------------------------
-# Real `opencode` binary stays untouched (CLI / serve).
-# Wrapper names: opencode-bot and oc-agent
-
-WRAPPER_BODY=$(cat << WRAP
-#!/usr/bin/env bash
+WRAPPER_BODY="${BASH_SHEBANG}
 # Launches the OpenCode + Telegram agent stack
-exec "$WORKDIR/start.sh" "\$@"
-WRAP
-)
+exec \"${WORKDIR}/start.sh\" \"\$@\"
+"
 
 install_wrapper() {
     local dest="$1"
     local name="$2"
-    echo "$WRAPPER_BODY" > "$dest/$name"
+    printf '%s\n' "$WRAPPER_BODY" > "$dest/$name"
     chmod 755 "$dest/$name"
     echo "[+] Installed wrapper: $dest/$name"
 }
 
-# Prefer directories already on PATH
 if [ "$ENV_TYPE" = "termux" ] && [ -d "${PREFIX:-/data/data/com.termux/files/usr}/bin" ]; then
     install_wrapper "${PREFIX}/bin" "opencode-bot"
     install_wrapper "${PREFIX}/bin" "oc-agent"
