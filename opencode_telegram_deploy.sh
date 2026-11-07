@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OpenCode Agent & Telegram Bot Deployer (Hardened)
+# OpenCode Agent & Telegram Bot Deployer (Hardened + Auto-Restart)
 # ==============================================================================
 set -euo pipefail
 
@@ -13,15 +13,12 @@ echo "=========================================="
 # ---------------------------------------------------------------------------
 if [ -n "${TERMUX_VERSION:-}" ] || [ -d "/data/data/com.termux" ]; then
     ENV_TYPE="termux"
-    PREFIX_PATH="${PREFIX:-/data/data/com.termux/files/usr}"
     echo "[+] Detected Environment: Termux on Android"
 elif [ -f /etc/os-release ]; then
     ENV_TYPE="linux"
-    PREFIX_PATH="/usr"
     echo "[+] Detected Environment: Standard Linux"
 else
     ENV_TYPE="unknown"
-    PREFIX_PATH="/usr"
     echo "[!] Unknown environment, defaulting to generic Linux layout"
 fi
 
@@ -125,12 +122,13 @@ else
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 fi
 
-# Create a minimal .gitignore so the token is less likely to be committed
+# Prevent accidental commit of secrets / logs
 if [ ! -f "$WORKDIR/.gitignore" ]; then
     cat > "$WORKDIR/.gitignore" <<'GITIGNORE'
 .env
 venv/
 *.log
+*.pid
 __pycache__/
 *.pyc
 GITIGNORE
@@ -162,7 +160,6 @@ from telegram.ext import (
     filters,
 )
 
-# Load configuration from environment (exported by start.sh)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENCODE_HOST = os.getenv("OPENCODE_HOST", "127.0.0.1")
 OPENCODE_PORT = os.getenv("OPENCODE_PORT", "4096")
@@ -175,12 +172,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("opencode-bridge")
 
-# Simple in-memory last-prompt store for regenerate (per chat)
+# last prompt per chat for regenerate
 _last_prompt: Dict[int, str] = {}
 
 
 async def query_opencode(prompt: str, user_id: int) -> str:
-    """Send prompt to local OpenCode server (OpenAI-compatible shape)."""
     payload = {
         "model": "opencode",
         "messages": [{"role": "user", "content": prompt}],
@@ -204,7 +200,7 @@ async def query_opencode(prompt: str, user_id: int) -> str:
     except aiohttp.ClientConnectorError:
         return (
             f"Could not connect to OpenCode at {OPENCODE_HOST}:{OPENCODE_PORT}. "
-            "Ensure 'opencode serve' is running."
+            "Ensure the server is running (auto-restart should recover shortly)."
         )
     except asyncio.TimeoutError:
         return "Agent execution timed out (90s)."
@@ -224,9 +220,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "OpenCode Agent Bridge Active.\n"
         "Send any code instruction, command, or task.\n\n"
-        "Buttons:\n"
         "• Clear Context – forget last prompt for this chat\n"
-        "• Server Health – ping local OpenCode",
+        "• Server Health – ping local OpenCode\n"
+        "• Regenerate – re-run the last prompt",
         reply_markup=reply_markup,
     )
 
@@ -239,21 +235,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # Remember for regenerate
     _last_prompt[chat_id] = user_text
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
     response = await query_opencode(user_text, user_id)
 
     keyboard = [[InlineKeyboardButton("Regenerate", callback_data="regen")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Telegram 4096 limit – leave margin
     if len(response) > 4000:
         for i in range(0, len(response), 4000):
             chunk = response[i : i + 4000]
-            # Only attach button to the last chunk
             if i + 4000 >= len(response):
                 await update.message.reply_text(chunk, reply_markup=reply_markup)
             else:
@@ -281,7 +273,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         else f"OpenCode Alert: {r.status}"
                     )
         except Exception:
-            status = f"OpenCode Offline (connection refused on port {OPENCODE_PORT})"
+            status = f"OpenCode Offline (port {OPENCODE_PORT}) — watchdog should restart it shortly."
         await query.edit_message_text(status)
     elif query.data == "regen":
         last = _last_prompt.get(chat_id)
@@ -319,7 +311,7 @@ EOF
 chmod 755 "$WORKDIR/bridge.py"
 
 # ---------------------------------------------------------------------------
-# 7. Generate hardened start.sh
+# 7. Generate hardened start.sh WITH AUTO-RESTART WATCHDOG
 # ---------------------------------------------------------------------------
 cat > "$WORKDIR/start.sh" << 'EOF'
 #!/usr/bin/env bash
@@ -328,7 +320,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 cd "$DIR"
 
-# Safe env loading (no word-splitting / injection from values)
+# Safe env loading
 if [ -f .env ]; then
     set -a
     # shellcheck source=/dev/null
@@ -341,44 +333,74 @@ fi
 
 PORT="${OPENCODE_PORT:-4096}"
 HOST="${OPENCODE_HOST:-127.0.0.1}"
+LOG="$DIR/opencode_server.log"
+PIDFILE="$DIR/opencode.pid"
+WATCHDOG_INTERVAL=15
 
-# Keep Termux awake if available
+# Termux wake lock
 if command -v termux-wake-lock >/dev/null 2>&1; then
     termux-wake-lock || true
     echo "[+] Activated Termux wake lock."
 fi
 
-# Activate venv
 # shellcheck source=/dev/null
 source venv/bin/activate
 
-# Check whether something is already listening on the port
 port_in_use() {
     if command -v ss >/dev/null 2>&1; then
         ss -tuln 2>/dev/null | grep -q ":${PORT} "
     elif command -v lsof >/dev/null 2>&1; then
         lsof -i ":${PORT}" >/dev/null 2>&1
     else
-        # Fallback: try a quick connect
         (echo >/dev/tcp/127.0.0.1/"${PORT}") >/dev/null 2>&1
     fi
 }
 
-if ! port_in_use; then
-    echo "[*] Launching OpenCode server on ${HOST}:${PORT}..."
-    nohup opencode serve --port "$PORT" > "$DIR/opencode_server.log" 2>&1 &
-    OC_PID=$!
-    echo "[+] OpenCode started with PID $OC_PID (log: opencode_server.log)"
-    # Give it a moment to bind
-    sleep 3
-    if ! port_in_use; then
-        echo "[!] Warning: port $PORT still not listening. Check opencode_server.log"
+start_opencode() {
+    # Kill any stale process recorded in the pidfile
+    if [ -f "$PIDFILE" ]; then
+        oldpid=$(cat "$PIDFILE" 2>/dev/null || true)
+        if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+            kill "$oldpid" 2>/dev/null || true
+            sleep 1
+        fi
+        rm -f "$PIDFILE"
     fi
+
+    echo "[*] Starting OpenCode on ${HOST}:${PORT}..."
+    nohup opencode serve --port "$PORT" >> "$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "[+] OpenCode PID $(cat "$PIDFILE") (log: $LOG)"
+    sleep 2
+}
+
+# Initial launch
+if port_in_use; then
+    echo "[+] Port $PORT already in use — assuming OpenCode is running."
 else
-    echo "[+] Something is already listening on port $PORT — assuming OpenCode is up."
+    start_opencode
+    if ! port_in_use; then
+        echo "[!] OpenCode did not bind to port $PORT. Check $LOG"
+    fi
 fi
 
-echo "[*] Starting Telegram Bot bridge..."
+# Background watchdog — restarts OpenCode if the port stops listening
+(
+    while true; do
+        sleep "$WATCHDOG_INTERVAL"
+        if ! port_in_use; then
+            echo "$(date -Is) [watchdog] OpenCode not listening on :$PORT — restarting" >> "$LOG"
+            start_opencode
+        fi
+    done
+) &
+WATCHDOG_PID=$!
+echo "[+] Watchdog running (PID $WATCHDOG_PID, interval ${WATCHDOG_INTERVAL}s)"
+
+# Ensure watchdog is cleaned up if the bridge exits
+trap 'kill $WATCHDOG_PID 2>/dev/null || true' EXIT
+
+echo "[*] Starting Telegram Bot bridge (foreground)..."
 exec python3 bridge.py
 EOF
 
@@ -397,9 +419,14 @@ echo ""
 echo "To start the agent + Telegram bot:"
 echo "  cd $WORKDIR && ./start.sh"
 echo ""
+echo "Auto-restart:"
+echo "  A background watchdog checks every 15s whether the OpenCode"
+echo "  port is still listening. If not, it restarts the server and logs"
+echo "  the event to opencode_server.log. You do not need to reopen a"
+echo "  terminal for ordinary crashes."
+echo ""
 echo "Notes:"
 echo "  • Bot token is stored in plaintext .env — keep the directory private."
 echo "  • OpenCode must speak an OpenAI-compatible /v1/chat/completions."
 echo "  • Regenerate re-sends the last prompt stored for that chat."
-echo "  • No automatic restart of OpenCode if it crashes; check the log."
 echo "=========================================="
