@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OpenCode Agent & Telegram Bot Deployer (Hardened + Auto-Restart)
+# OpenCode Agent & Telegram Bot Deployer
+# Hardened + auto-restart + modern OpenCode install/update + PATH wrapper
 # ==============================================================================
 set -euo pipefail
 
@@ -23,7 +24,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Package Manager & Dependency Setup
+# 2. Package Manager & Base Dependencies
 # ---------------------------------------------------------------------------
 echo "[*] Installing required base dependencies (Node.js, Python, Git, Curl, jq)..."
 
@@ -54,24 +55,64 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. OpenCode Installation
+# 3. OpenCode — detect / update / install
 # ---------------------------------------------------------------------------
-echo "[*] Checking for OpenCode installation..."
-if ! command -v opencode >/dev/null 2>&1; then
-    echo "[*] Installing opencode via npm (trying common package names)..."
-    if [ "$ENV_TYPE" = "termux" ]; then
-        npm install -g opencode-ai 2>/dev/null || npm install -g opencode || {
-            echo "[-] Failed to install opencode. Install it manually and re-run."
-            exit 1
-        }
-    else
-        $SUDO_CMD npm install -g opencode-ai 2>/dev/null || $SUDO_CMD npm install -g opencode || {
-            echo "[-] Failed to install opencode. Install it manually and re-run."
-            exit 1
-        }
+echo "[*] Checking for OpenCode..."
+
+install_opencode() {
+    # Prefer modern packages, then legacy, then official install script
+    echo "[*] Installing / updating OpenCode..."
+
+    local ok=0
+
+    # 1) Official V2 scoped package
+    if npm install -g "@opencode/cli@latest" 2>/dev/null; then
+        ok=1
+    # 2) Legacy package name still in wide use
+    elif npm install -g "opencode-ai@latest" 2>/dev/null; then
+        ok=1
+    # 3) Bare name fallback
+    elif npm install -g "opencode@latest" 2>/dev/null; then
+        ok=1
+    # 4) Official curl installer (puts binary in ~/.opencode/bin or similar)
+    elif curl -fsSL https://opencode.ai/install | bash; then
+        ok=1
+        # Ensure the install location is on PATH for this session
+        if [ -d "$HOME/.opencode/bin" ]; then
+            export PATH="$HOME/.opencode/bin:$PATH"
+        fi
     fi
+
+    if [ "$ok" -ne 1 ]; then
+        echo "[-] Failed to install OpenCode. Install manually then re-run."
+        echo "    Suggested:  npm i -g @opencode/cli@latest"
+        echo "            or: curl -fsSL https://opencode.ai/install | bash"
+        exit 1
+    fi
+}
+
+if command -v opencode >/dev/null 2>&1; then
+    CURRENT_VER=$(opencode --version 2>/dev/null || echo "unknown")
+    echo "[+] OpenCode already present: $(command -v opencode)  (version: $CURRENT_VER)"
+    echo "[*] Updating to latest..."
+    install_opencode
+    NEW_VER=$(opencode --version 2>/dev/null || echo "unknown")
+    echo "[+] OpenCode after update: $NEW_VER"
 else
-    echo "[+] OpenCode is already installed: $(command -v opencode)"
+    echo "[*] OpenCode not found — installing..."
+    install_opencode
+    if command -v opencode >/dev/null 2>&1; then
+        echo "[+] OpenCode installed: $(command -v opencode)  ($(opencode --version 2>/dev/null || echo '?'))"
+    else
+        # curl installer may have put it in ~/.opencode/bin
+        if [ -x "$HOME/.opencode/bin/opencode" ]; then
+            export PATH="$HOME/.opencode/bin:$PATH"
+            echo "[+] OpenCode found at $HOME/.opencode/bin/opencode"
+        else
+            echo "[-] opencode binary still not on PATH after install."
+            exit 1
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -172,7 +213,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("opencode-bridge")
 
-# last prompt per chat for regenerate
 _last_prompt: Dict[int, str] = {}
 
 
@@ -343,6 +383,11 @@ if command -v termux-wake-lock >/dev/null 2>&1; then
     echo "[+] Activated Termux wake lock."
 fi
 
+# Ensure ~/.opencode/bin is on PATH if the curl installer was used
+if [ -d "$HOME/.opencode/bin" ]; then
+    export PATH="$HOME/.opencode/bin:$PATH"
+fi
+
 # shellcheck source=/dev/null
 source venv/bin/activate
 
@@ -357,7 +402,6 @@ port_in_use() {
 }
 
 start_opencode() {
-    # Kill any stale process recorded in the pidfile
     if [ -f "$PIDFILE" ]; then
         oldpid=$(cat "$PIDFILE" 2>/dev/null || true)
         if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
@@ -374,7 +418,6 @@ start_opencode() {
     sleep 2
 }
 
-# Initial launch
 if port_in_use; then
     echo "[+] Port $PORT already in use — assuming OpenCode is running."
 else
@@ -384,7 +427,7 @@ else
     fi
 fi
 
-# Background watchdog — restarts OpenCode if the port stops listening
+# Background watchdog
 (
     while true; do
         sleep "$WATCHDOG_INTERVAL"
@@ -397,7 +440,6 @@ fi
 WATCHDOG_PID=$!
 echo "[+] Watchdog running (PID $WATCHDOG_PID, interval ${WATCHDOG_INTERVAL}s)"
 
-# Ensure watchdog is cleaned up if the bridge exits
 trap 'kill $WATCHDOG_PID 2>/dev/null || true' EXIT
 
 echo "[*] Starting Telegram Bot bridge (foreground)..."
@@ -405,6 +447,49 @@ exec python3 bridge.py
 EOF
 
 chmod 755 "$WORKDIR/start.sh"
+
+# ---------------------------------------------------------------------------
+# 8. Install PATH wrapper so the full stack is one command away
+# ---------------------------------------------------------------------------
+# Real `opencode` binary stays untouched (CLI / serve).
+# Wrapper names: opencode-bot and oc-agent
+
+WRAPPER_BODY=$(cat << WRAP
+#!/usr/bin/env bash
+# Launches the OpenCode + Telegram agent stack
+exec "$WORKDIR/start.sh" "\$@"
+WRAP
+)
+
+install_wrapper() {
+    local dest="$1"
+    local name="$2"
+    echo "$WRAPPER_BODY" > "$dest/$name"
+    chmod 755 "$dest/$name"
+    echo "[+] Installed wrapper: $dest/$name"
+}
+
+# Prefer directories already on PATH
+if [ "$ENV_TYPE" = "termux" ] && [ -d "${PREFIX:-/data/data/com.termux/files/usr}/bin" ]; then
+    install_wrapper "${PREFIX}/bin" "opencode-bot"
+    install_wrapper "${PREFIX}/bin" "oc-agent"
+elif [ -d "$HOME/bin" ]; then
+    install_wrapper "$HOME/bin" "opencode-bot"
+    install_wrapper "$HOME/bin" "oc-agent"
+    case ":$PATH:" in
+        *":$HOME/bin:"*) ;;
+        *) echo "[!] $HOME/bin is not on PATH — add it or re-login" ;;
+    esac
+elif [ -w /usr/local/bin ] 2>/dev/null; then
+    install_wrapper "/usr/local/bin" "opencode-bot"
+    install_wrapper "/usr/local/bin" "oc-agent"
+else
+    mkdir -p "$HOME/bin"
+    install_wrapper "$HOME/bin" "opencode-bot"
+    install_wrapper "$HOME/bin" "oc-agent"
+    echo "[!] Added wrappers to $HOME/bin — ensure it is on your PATH:"
+    echo "    export PATH=\"\$HOME/bin:\$PATH\""
+fi
 
 # ---------------------------------------------------------------------------
 # Done
@@ -416,17 +501,15 @@ echo "=========================================="
 echo "Project directory : $WORKDIR"
 echo "Config (mode 600) : $WORKDIR/.env"
 echo ""
-echo "To start the agent + Telegram bot:"
-echo "  cd $WORKDIR && ./start.sh"
+echo "Launch the full agent + Telegram stack from anywhere:"
+echo "  opencode-bot"
+echo "  # or"
+echo "  oc-agent"
 echo ""
-echo "Auto-restart:"
-echo "  A background watchdog checks every 15s whether the OpenCode"
-echo "  port is still listening. If not, it restarts the server and logs"
-echo "  the event to opencode_server.log. You do not need to reopen a"
-echo "  terminal for ordinary crashes."
+echo "  (or:  cd $WORKDIR && ./start.sh)"
 echo ""
-echo "Notes:"
-echo "  • Bot token is stored in plaintext .env — keep the directory private."
-echo "  • OpenCode must speak an OpenAI-compatible /v1/chat/completions."
-echo "  • Regenerate re-sends the last prompt stored for that chat."
+echo "OpenCode CLI itself remains available as:  opencode"
+echo ""
+echo "Auto-restart: watchdog checks the serve port every 15s and"
+echo "restarts OpenCode if it dies. Log: $WORKDIR/opencode_server.log"
 echo "=========================================="
