@@ -1,0 +1,35 @@
+{
+  "nvidia/llama-3.2-nv-rerankqa-1b-v2": {
+    "task": "ranking",
+    "endpoint": "https://integrate.api.nvidia.com/v1/ranking",
+    "payload": {
+      "model": "nvidia/llama-3.2-nv-rerankqa-1b-v2",
+      "query": {"text": "What is the memory bandwidth of H100?"},
+      "passages": [
+        {"text": "H100 has approximately 3.35 TB/s memory bandwidth."},
+        {"text": "A100 has lower memory bandwidth than H100."}
+      ]
+    }
+  },
+  "nvidia/nv-rerankqa-mistral-4b-v3": {
+    "task": "rerank",
+    "endpoint": "https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking",
+    "payload": {
+      "model": "nvidia/nv-rerankqa-mistral-4b-v3",
+      "query": {"text": "What is the memory bandwidth of H100?"},
+      "passages": [
+        {"text": "H100 has approximately 3.35 TB/s memory bandwidth."},
+        {"text": "A100 has lower memory bandwidth than H100."}
+      ]
+    }
+  },
+  "black-forest-labs/flux.1-dev": {
+    "task": "image_generation",
+    "endpoint": "https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.1-dev",
+    "payload": {
+      "prompt": "a red cube on a white table, studio lighting",
+      "cfg_scale": 3.5,
+      "steps": 20
+    }
+  }
+}
